@@ -784,6 +784,15 @@ typedef struct {
     float pitch_bend;
     float mod_wheel;
 
+    /* Modulation, live (read by get_param("live_mod")): where the sound has
+     * the matrix's targets, the last rendered sample's, in the params' own
+     * units: osc1_freq 0..1 (from the octaves detune + matrix), osc2_pitch
+     * -2..2 octaves (knob + matrix), filter_cutoff 0..1 (from the Hz the
+     * filter runs at: knob, velocity, matrix), the four slow targets 0..1
+     * (compute_modulated_params) */
+    float live_osc1_oct, live_osc2_pitch, live_cutoff_hz;
+    float live_timbre, live_harmonics, live_fold_depth, live_fold_type;
+
     /* Page tracking for knob overlay */
     int current_page;
 
@@ -1613,6 +1622,24 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
         return n;
     }
 
+    /* Modulation, live: where the sound has the controls the matrix and
+     * velocity move now, in the params' own units: osc1_freq 0..1 (0.5 +
+     * octaves / 2), osc2_pitch -2..2 octaves, filter_cutoff 0..1 (the Hz
+     * back through the knob's law: hz = 30 * (20000/30)^(c^2)), timbre,
+     * harmonics, fold depth and type 0..1; {} while no note sounds */
+    if (strcmp(key, "live_mod") == 0) {
+        if (!(inst->note_active || inst->env.stage == 3)) return snprintf(buf, buf_len, "{}");
+        float o1 = 0.5f + 0.5f * inst->live_osc1_oct;
+        float o2 = inst->live_osc2_pitch;
+        float cr = inst->live_cutoff_hz > 30.0f ? logf(inst->live_cutoff_hz / 30.0f) / logf(20000.0f / 30.0f) : 0.0f;
+        float c = sqrtf(cr < 1.0f ? cr : 1.0f);
+        return snprintf(buf, buf_len,
+                        "{\"osc1_freq\":%.4f,\"osc2_pitch\":%.4f,\"filter_cutoff\":%.4f,\"osc1_timbre\":%.4f,"
+                        "\"osc2_harmonics\":%.4f,\"fold_depth\":%.4f,\"fold_type\":%.4f}",
+                        o1 < 0.0f ? 0.0f : o1 > 1.0f ? 1.0f : o1, o2 < -2.0f ? -2.0f : o2 > 2.0f ? 2.0f : o2, c,
+                        inst->live_timbre, inst->live_harmonics, inst->live_fold_depth, inst->live_fold_type);
+    }
+
     /* Individual param getters */
     if (strcmp(key, "osc1_freq")      == 0) return snprintf(buf, buf_len, "%.4f", inst->enc_osc1_freq);
     if (strcmp(key, "osc1_timbre")    == 0) return snprintf(buf, buf_len, "%.4f", inst->enc_osc1_timbre);
@@ -1741,6 +1768,10 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
     /* Per-block modulated params (slow targets) */
     modulated_params_t mp;
     compute_modulated_params(inst, &mp);
+    inst->live_timbre = mp.osc1_timbre;        /* live_mod */
+    inst->live_harmonics = mp.osc2_harmonics;
+    inst->live_fold_depth = mp.fold_depth;
+    inst->live_fold_type = mp.fold_type;
 
     /* Analog drift */
     {
@@ -1817,6 +1848,7 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
             for (int r = 0; r < MOD_ROWS; r++)
                 mod_oct += src[r] * w_pitch1[r];
             float osc1_hz = midi_hz * powf(2.0f, detune_oct + bend_semi / 12.0f + mod_oct) * drift1_ratio;
+            inst->live_osc1_oct = detune_oct + mod_oct;   /* live_mod */
             osc1_hz = fmaxf(10.0f, fminf(20000.0f, osc1_hz));
 
             /* OSC2 frequency (per-sample) */
@@ -1824,6 +1856,10 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
             float osc2_cv = midi_cv + inst->sm_osc2_pitch + bend_semi / 12.0f;
             for (int r = 0; r < MOD_ROWS; r++)
                 osc2_cv += src[r] * w_pitch2[r];
+            float live_osc2 = inst->sm_osc2_pitch;   /* live_mod: the knob and the matrix (the note and the bend are not the knob's) */
+            for (int r = 0; r < MOD_ROWS; r++)
+                live_osc2 += src[r] * w_pitch2[r];
+            inst->live_osc2_pitch = live_osc2;
             osc2_cv = fmaxf(-5.0f, fminf(7.0f, osc2_cv));
             float osc2_hz = cv_to_freq(osc2_cv) * drift2_ratio;
             osc2_hz = fmaxf(10.0f, fminf(20000.0f, osc2_hz));
@@ -1833,6 +1869,7 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
             for (int r = 0; r < MOD_ROWS; r++)
                 cutoff_hz += src[r] * w_cutoff[r];
             cutoff_hz = fmaxf(20.0f, fminf(20000.0f, cutoff_hz));
+            inst->live_cutoff_hz = cutoff_hz;   /* live_mod */
 
             /* Oscillators */
             float s1 = complex_osc_sample(&inst->osc1, osc1_hz, mp.osc1_timbre);
